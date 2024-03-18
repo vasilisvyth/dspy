@@ -1,11 +1,11 @@
 from collections import Counter
-from typing import Callable, Any, Optional
+from typing import Any, Callable, Optional
 
 import dsp
-from dsp.utils import zipstar, normalize_text
-from dsp.utils.utils import dotdict
-from dsp.templates.template_v3 import Template
 from dsp.primitives.demonstrate import Example
+from dsp.templates.template_v3 import Template
+from dsp.utils import normalize_text, zipstar
+from dsp.utils.utils import dotdict
 
 
 class Completions:
@@ -98,11 +98,20 @@ def _generate(template: Template, **kwargs) -> Callable:
             completion[field_names[last_field_idx]] = ""
 
             # Recurse with greedy decoding and a shorter length.
-            max_tokens = kwargs.get("max_tokens", dsp.settings.lm.kwargs["max_tokens"])
+            max_tokens = (kwargs.get("max_tokens") or 
+                        kwargs.get("max_output_tokens") or
+                        dsp.settings.lm.kwargs.get("max_tokens") or 
+                        dsp.settings.lm.kwargs.get('max_output_tokens'))
+
+
+            if max_tokens is None:
+                raise ValueError("Required 'max_tokens' or 'max_output_tokens' not specified in settings.")
             max_tokens = min(max(75, max_tokens // 2), max_tokens)
+            keys = list(kwargs.keys()) + list(dsp.settings.lm.kwargs.keys()) 
+            max_tokens_key = "max_tokens" if "max_tokens" in keys else "max_output_tokens"
             new_kwargs = {
                 **kwargs,
-                "max_tokens": max_tokens,
+                max_tokens_key: max_tokens,
                 "n": 1,
                 "temperature": 0.0,
             }

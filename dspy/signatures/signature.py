@@ -1,12 +1,14 @@
 import ast
-from copy import deepcopy
+import re
+import types
 import typing
-import dsp
+from copy import deepcopy
+from typing import Any, Dict, Tuple, Type, Union  # noqa: UP035
+
 from pydantic import BaseModel, Field, create_model
 from pydantic.fields import FieldInfo
-from typing import Any, Type, Union, Dict, Tuple  # noqa: UP035
-import re
 
+import dsp
 from dspy.signatures.field import InputField, OutputField, new_to_old_field
 
 
@@ -33,7 +35,9 @@ class SignatureMeta(type(BaseModel)):
     def __new__(mcs, signature_name, bases, namespace, **kwargs):  # noqa: N804
         # Set `str` as the default type for all fields
         raw_annotations = namespace.get("__annotations__", {})
-        for name, _field in namespace.items():
+        for name, field in namespace.items():
+            if not isinstance(field, FieldInfo):
+                continue  # Don't add types to non-field attributes
             if not name.startswith("__") and name not in raw_annotations:
                 raw_annotations[name] = str
         namespace["__annotations__"] = raw_annotations
@@ -41,6 +45,17 @@ class SignatureMeta(type(BaseModel)):
         # Let Pydantic do its thing
         cls = super().__new__(mcs, signature_name, bases, namespace, **kwargs)
 
+        # If we don't have instructions, it might be because we are a derived generic type.
+        # In that case, we should inherit the instructions from the base class.
+        if cls.__doc__ is None:
+            for base in bases:
+                if isinstance(base, SignatureMeta):
+                    doc = getattr(base, "__doc__", "")
+                    if doc != "":
+                        cls.__doc__ = doc
+
+        # The more likely case is that the user has just not given us a type.
+        # In that case, we should default to the input/output format.
         if cls.__doc__ is None:
             cls.__doc__ = _default_instructions(cls)
 
@@ -62,7 +77,7 @@ class SignatureMeta(type(BaseModel)):
             field_type = extra.get("__dspy_field_type")
             if field_type not in ["input", "output"]:
                 raise TypeError(
-                    f"Field '{name}' in '{cls.__name__}' must be declared with InputField or OutputField.",
+                    f"Field '{name}' in '{cls.__name__}' must be declared with InputField or OutputField. {field.json_schema_extra=}",
                 )
 
     @property
@@ -167,32 +182,37 @@ class SignatureMeta(type(BaseModel)):
         return f"{cls.__name__}({cls.signature}\n    instructions={repr(cls.instructions)}\n    {field_repr}\n)"
 
 
+# A signature for a predictor.
+#
+# You typically subclass it, like this:
+# class MySignature(Signature):
+#     input: str = InputField(desc="...")  # noqa: ERA001
+#     output: int = OutputField(desc="...")  # noqa: ERA001
+#
+# You can call Signature("input1, input2 -> output1, output2") to create a new signature type.
+# You can also include instructions, Signature("input -> output", "This is a test").
+# But it's generally better to use the make_signature function.
+#
+# If you are not sure if your input is a string representation, (like "input1, input2 -> output1, output2"),
+# or a signature, you can use the ensure_signature function.
+#
+# For compatibility with the legacy dsp format, you can use the signature_to_template function.
+#
 class Signature(BaseModel, metaclass=SignatureMeta):
-    """A signature for a predictor.
+    ""  # noqa: D419
 
-    You typically subclass it, like this:
-    class MySignature(Signature):
-        input: str = InputField(desc="...")
-        output: int = OutputField(desc="...")
-
-    You can call Signature("input1, input2 -> output1, output2") to create a new signature type.
-    You can also include instructions, Signature("input -> output", "This is a test").
-    But it's generally better to use the make_signature function.
-
-    If you are not sure if your input is a string representation, (like "input1, input2 -> output1, output2"),
-    or a signature, you can use the ensure_signature function.
-
-    For compatibility with the legacy dsp format, you can use the signature_to_template function.
-    """
-
+    # Note: Don't put a docstring here, as it will become the default instructions
+    # for any signature that doesn't define it's own instructions.
     pass
 
 
-def ensure_signature(signature: Union[str, Type[Signature]]) -> Signature:
+def ensure_signature(signature: Union[str, Type[Signature]], instructions=None) -> Signature:
     if signature is None:
         return None
     if isinstance(signature, str):
-        return Signature(signature)
+        return Signature(signature, instructions)
+    if instructions is not None:
+        raise ValueError("Don't specify instructions when initializing with a Signature")
     return signature
 
 
@@ -232,7 +252,8 @@ def make_signature(
         # program of thought and teleprompters, so we just silently default to string.
         if type_ is None:
             type_ = str
-        if not isinstance(type_, type) and not isinstance(typing.get_origin(type_), type):
+        # if not isinstance(type_, type) and not isinstance(typing.get_origin(type_), type):
+        if not isinstance(type_, (type, typing._GenericAlias, types.GenericAlias)):
             raise ValueError(f"Field types must be types, not {type(type_)}")
         if not isinstance(field, FieldInfo):
             raise ValueError(f"Field values must be Field instances, not {type(field)}")
@@ -255,31 +276,25 @@ def make_signature(
 
 
 def _parse_signature(signature: str) -> Tuple[Type, Field]:
-    pattern = r"^\s*[\w\s,:]+\s*->\s*[\w\s,:]+\s*$"
-    if not re.match(pattern, signature):
-        raise ValueError(f"Invalid signature format: '{signature}'")
+    if signature.count("->") != 1:
+        raise ValueError(f"Invalid signature format: '{signature}', must contain exactly one '->'.")
+
+    inputs_str, outputs_str = signature.split("->")
 
     fields = {}
-    inputs_str, outputs_str = map(str.strip, signature.split("->"))
-    inputs = [v.strip() for v in inputs_str.split(",") if v.strip()]
-    outputs = [v.strip() for v in outputs_str.split(",") if v.strip()]
-    for name_type in inputs:
-        name, type_ = _parse_named_type_node(name_type)
+    for name, type_ in _parse_arg_string(inputs_str):
         fields[name] = (type_, InputField())
-    for name_type in outputs:
-        name, type_ = _parse_named_type_node(name_type)
+    for name, type_ in _parse_arg_string(outputs_str):
         fields[name] = (type_, OutputField())
 
     return fields
 
 
-def _parse_named_type_node(node, names=None) -> Any:
-    parts = node.split(":")
-    if len(parts) == 1:
-        return parts[0], str
-    name, type_str = parts
-    type_ = _parse_type_node(ast.parse(type_str), names)
-    return name, type_
+def _parse_arg_string(string: str, names=None) -> Dict[str, str]:
+    args = ast.parse("def f(" + string + "): pass").body[0].args.args
+    names = [arg.arg for arg in args]
+    types = [str if arg.annotation is None else _parse_type_node(arg.annotation) for arg in args]
+    return zip(names, types)
 
 
 def _parse_type_node(node, names=None) -> Any:
@@ -288,7 +303,7 @@ def _parse_type_node(node, names=None) -> Any:
     without using structural pattern matching introduced in Python 3.10.
     """
     if names is None:
-        names = {}
+        names = typing.__dict__
 
     if isinstance(node, ast.Module):
         body = node.body
@@ -307,15 +322,22 @@ def _parse_type_node(node, names=None) -> Any:
         for type_ in [int, str, float, bool, list, tuple, dict]:
             if type_.__name__ == id_:
                 return type_
+        raise ValueError(f"Unknown name: {id_}")
 
-    elif isinstance(node, ast.Subscript):
+    if isinstance(node, ast.Subscript):
         base_type = _parse_type_node(node.value, names)
         arg_type = _parse_type_node(node.slice, names)
         return base_type[arg_type]
 
-    elif isinstance(node, ast.Tuple):
+    if isinstance(node, ast.Tuple):
         elts = node.elts
         return tuple(_parse_type_node(elt, names) for elt in elts)
+
+    if isinstance(node, ast.Call):
+        if node.func.id == "Field":
+            keys = [kw.arg for kw in node.keywords]
+            values = [kw.value.value for kw in node.keywords]
+            return Field(**dict(zip(keys, values)))
 
     raise ValueError(f"Code is not syntactically valid: {node}")
 
